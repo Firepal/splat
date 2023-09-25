@@ -155,6 +155,7 @@ let cameras = [
 	},
 ];
 
+
 const camera = cameras[0];
 
 function getProjectionMatrix(fx, fy, width, height) {
@@ -298,18 +299,30 @@ function createWorker(self) {
 	const rowLength = 3 * 4 + 3 * 4 + 4 + 4;
 	let depthMix = new BigInt64Array();
 	let lastProj = [];
-
+	let lastVertexCount = 0;
 	const runSort = (viewProj) => {
 		if (!buffer) return;
 
 		const f_buffer = new Float32Array(buffer);
 		const u_buffer = new Uint8Array(buffer);
+        
+        // vertexCount = total splat count
+        const quad_vertices = [
+            -2, -2, 
+             2, -2,
+             2,  2,
+            -2,  2
+        ]
+		const vertices = new Float32Array(4 * vertexCount);
+        
+        let quad_size = 2 * vertexCount
+        
+		const covA = new Float32Array(3 * quad_size);
+		const covB = new Float32Array(3 * quad_size);
 
-		const covA = new Float32Array(3 * vertexCount);
-		const covB = new Float32Array(3 * vertexCount);
-
-		const center = new Float32Array(3 * vertexCount);
-		const color = new Float32Array(4 * vertexCount);
+		const center = new Float32Array(3 * quad_size);
+		const color = new Float32Array(4 * quad_size);
+		const index = new Uint32Array(6 * vertexCount);
 
 		if (depthMix.length !== vertexCount) {
 			depthMix = new BigInt64Array(vertexCount);
@@ -344,71 +357,105 @@ function createWorker(self) {
 
 		depthMix.sort();
 
+		if (vertexCount > lastVertexCount) {
+			console.log("Updating vertex buffers with new data")
+            
+			for (let j = 0; j < vertexCount; j++) {
+                let scale = [
+                    f_buffer[8 * j + 3 + 0],
+                    f_buffer[8 * j + 3 + 1],
+                    f_buffer[8 * j + 3 + 2],
+                ];
+                let rot = [
+                    (u_buffer[32 * j + 28 + 0] - 128) / 128,
+                    (u_buffer[32 * j + 28 + 1] - 128) / 128,
+                    (u_buffer[32 * j + 28 + 2] - 128) / 128,
+                    (u_buffer[32 * j + 28 + 3] - 128) / 128,
+                ];
+
+                const R = [
+                    1.0 - 2.0 * (rot[2] * rot[2] + rot[3] * rot[3]),
+                    2.0 * (rot[1] * rot[2] + rot[0] * rot[3]),
+                    2.0 * (rot[1] * rot[3] - rot[0] * rot[2]),
+
+                    2.0 * (rot[1] * rot[2] - rot[0] * rot[3]),
+                    1.0 - 2.0 * (rot[1] * rot[1] + rot[3] * rot[3]),
+                    2.0 * (rot[2] * rot[3] + rot[0] * rot[1]),
+
+                    2.0 * (rot[1] * rot[3] + rot[0] * rot[2]),
+                    2.0 * (rot[2] * rot[3] - rot[0] * rot[1]),
+                    1.0 - 2.0 * (rot[1] * rot[1] + rot[2] * rot[2]),
+                ];
+
+                // Compute the matrix product of S and R (M = S * R)
+                const M = [
+                    scale[0] * R[0],
+                    scale[0] * R[1],
+                    scale[0] * R[2],
+                    scale[1] * R[3],
+                    scale[1] * R[4],
+                    scale[1] * R[5],
+                    scale[2] * R[6],
+                    scale[2] * R[7],
+                    scale[2] * R[8],
+                ];
+                
+                for (let vert = 0; vert < 4; vert++) {
+                    let o = j*4*4
+                    let vo = vert*4
+                    for (let k = 0; k < 8; k++) {
+                        vertices[o + k + (vert*8)] = quad_vertices[k];
+                    }
+                    
+                    
+                    if (j <= 100) {
+                        // console.log(j, " ", o, " ", vo)
+                        console.log(4 * o + 0 + vo, color.length)
+                        
+                    }
+
+                    color[4 * o + 0 + vo] = u_buffer[32 * j + 24 + 0] / 255;
+                    color[4 * o + 1 + vo] = u_buffer[32 * j + 24 + 1] / 255;
+                    color[4 * o + 2 + vo] = u_buffer[32 * j + 24 + 2] / 255;
+                    color[4 * o + 3 + vo] = u_buffer[32 * j + 24 + 3] / 255
+                    
+                    vo = vert*3
+                    
+                    center[3 * o + 0 + vo] = f_buffer[8 * j + 0];
+                    center[3 * o + 1 + vo] = f_buffer[8 * j + 1];
+                    center[3 * o + 2 + vo] = f_buffer[8 * j + 2];
+
+                    covA[3 * o + 0 + vo] = M[0] * M[0] + M[3] * M[3] + M[6] * M[6];
+                    covA[3 * o + 1 + vo] = M[0] * M[1] + M[3] * M[4] + M[6] * M[7];
+                    covA[3 * o + 2 + vo] = M[0] * M[2] + M[3] * M[5] + M[6] * M[8];
+                    covB[3 * o + 0 + vo] = M[1] * M[1] + M[4] * M[4] + M[7] * M[7];
+                    covB[3 * o + 1 + vo] = M[1] * M[2] + M[4] * M[5] + M[7] * M[8];
+                    covB[3 * o + 2 + vo] = M[2] * M[2] + M[5] * M[5] + M[8] * M[8];
+                } 
+            }
+            self.postMessage({ vertices, covA, center, color, covB, viewProj }, [
+                vertices.buffer,
+                covA.buffer,
+                center.buffer,
+                color.buffer,
+                covB.buffer,
+            ]);
+		}
+		// console.log(indexMix[2 * 0])
+		// console.log(indexMix[2 * 1])
 		for (let j = 0; j < vertexCount; j++) {
 			const i = indexMix[2 * j];
-
-			center[3 * j + 0] = f_buffer[8 * i + 0];
-			center[3 * j + 1] = f_buffer[8 * i + 1];
-			center[3 * j + 2] = f_buffer[8 * i + 2];
-
-			color[4 * j + 0] = u_buffer[32 * i + 24 + 0] / 255;
-			color[4 * j + 1] = u_buffer[32 * i + 24 + 1] / 255;
-			color[4 * j + 2] = u_buffer[32 * i + 24 + 2] / 255;
-			color[4 * j + 3] = u_buffer[32 * i + 24 + 3] / 255;
-
-			let scale = [
-				f_buffer[8 * i + 3 + 0],
-				f_buffer[8 * i + 3 + 1],
-				f_buffer[8 * i + 3 + 2],
-			];
-			let rot = [
-				(u_buffer[32 * i + 28 + 0] - 128) / 128,
-				(u_buffer[32 * i + 28 + 1] - 128) / 128,
-				(u_buffer[32 * i + 28 + 2] - 128) / 128,
-				(u_buffer[32 * i + 28 + 3] - 128) / 128,
-			];
-
-			const R = [
-				1.0 - 2.0 * (rot[2] * rot[2] + rot[3] * rot[3]),
-				2.0 * (rot[1] * rot[2] + rot[0] * rot[3]),
-				2.0 * (rot[1] * rot[3] - rot[0] * rot[2]),
-
-				2.0 * (rot[1] * rot[2] - rot[0] * rot[3]),
-				1.0 - 2.0 * (rot[1] * rot[1] + rot[3] * rot[3]),
-				2.0 * (rot[2] * rot[3] + rot[0] * rot[1]),
-
-				2.0 * (rot[1] * rot[3] + rot[0] * rot[2]),
-				2.0 * (rot[2] * rot[3] - rot[0] * rot[1]),
-				1.0 - 2.0 * (rot[1] * rot[1] + rot[2] * rot[2]),
-			];
-
-			// Compute the matrix product of S and R (M = S * R)
-			const M = [
-				scale[0] * R[0],
-				scale[0] * R[1],
-				scale[0] * R[2],
-				scale[1] * R[3],
-				scale[1] * R[4],
-				scale[1] * R[5],
-				scale[2] * R[6],
-				scale[2] * R[7],
-				scale[2] * R[8],
-			];
-
-			covA[3 * j + 0] = M[0] * M[0] + M[3] * M[3] + M[6] * M[6];
-			covA[3 * j + 1] = M[0] * M[1] + M[3] * M[4] + M[6] * M[7];
-			covA[3 * j + 2] = M[0] * M[2] + M[3] * M[5] + M[6] * M[8];
-			covB[3 * j + 0] = M[1] * M[1] + M[4] * M[4] + M[7] * M[7];
-			covB[3 * j + 1] = M[1] * M[2] + M[4] * M[5] + M[7] * M[8];
-			covB[3 * j + 2] = M[2] * M[2] + M[5] * M[5] + M[8] * M[8];
+			index[6 * j + 0] = (2*i)+0;
+			index[6 * j + 1] = (2*i)+1;
+			index[6 * j + 2] = (2*i)+2;
+			index[6 * j + 3] = (2*i)+0;
+			index[6 * j + 4] = (2*i)+2;
+			index[6 * j + 5] = (2*i)+3;
 		}
-
-		self.postMessage({ covA, center, color, covB, viewProj }, [
-			covA.buffer,
-			center.buffer,
-			color.buffer,
-			covB.buffer,
-		]);
+		// console.log(index.slice(0,32))
+		self.postMessage({ index }, [index.buffer]);
+		
+		lastVertexCount = vertexCount;
 
 		// console.timeEnd("sort");
 	};
@@ -581,13 +628,17 @@ function createWorker(self) {
 			runSort(viewProj);
 			buffer = processPlyBuffer(e.data.ply);
 			vertexCount = Math.floor(buffer.byteLength / rowLength);
+            console.log("vertexCount: " + vertexCount);
 			postMessage({ buffer: buffer });
 		} else if (e.data.buffer) {
+            console.log("new buffer?");
 			buffer = e.data.buffer;
 			vertexCount = e.data.vertexCount;
+            console.log("vertexCount: " + vertexCount);
 		} else if (e.data.vertexCount) {
 			vertexCount = e.data.vertexCount;
-		} else if (e.data.view) {
+            console.log("vertexCount: " + vertexCount);
+		} else if (e.data.view && !e.data.down) {
 			viewProj = e.data.view;
 			throttledSort();
 		}
@@ -720,6 +771,7 @@ async function main() {
 		splatData.length / rowLength > 500000 ? 1 : 1 / devicePixelRatio;
 	// const downsample = 1 / devicePixelRatio;
 	// const downsample = 1;
+    
 	console.log(splatData.length / rowLength, downsample);
 
 	const worker = new Worker(
@@ -745,6 +797,7 @@ async function main() {
 
 	const gl = canvas.getContext("webgl");
 	const ext = gl.getExtension("ANGLE_instanced_arrays");
+	const ext_uint = gl.getExtension("OES_element_index_uint");
 
 	const vertexShader = gl.createShader(gl.VERTEX_SHADER);
 	gl.shaderSource(vertexShader, vertexShaderSource);
@@ -803,7 +856,13 @@ async function main() {
 	gl.uniformMatrix4fv(u_view, false, viewMatrix);
 
 	// positions
-	const triangleVertices = new Float32Array([-2, -2, 2, -2, 2, 2, -2, 2]);
+    const quad_vertices = [
+        -2, -2, 
+         2, -2,
+         2,  2,
+        -2,  2
+    ]
+	const triangleVertices = new Float32Array(quad_vertices);
 	const vertexBuffer = gl.createBuffer();
 	gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
 	gl.bufferData(gl.ARRAY_BUFFER, triangleVertices, gl.STATIC_DRAW);
@@ -820,7 +879,6 @@ async function main() {
 	gl.enableVertexAttribArray(a_center);
 	gl.bindBuffer(gl.ARRAY_BUFFER, centerBuffer);
 	gl.vertexAttribPointer(a_center, 3, gl.FLOAT, false, 0, 0);
-	ext.vertexAttribDivisorANGLE(a_center, 1); // Use the extension here
 
 	// color
 	const colorBuffer = gl.createBuffer();
@@ -830,7 +888,6 @@ async function main() {
 	gl.enableVertexAttribArray(a_color);
 	gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
 	gl.vertexAttribPointer(a_color, 4, gl.FLOAT, false, 0, 0);
-	ext.vertexAttribDivisorANGLE(a_color, 1); // Use the extension here
 
 	// cov
 	const covABuffer = gl.createBuffer();
@@ -838,17 +895,27 @@ async function main() {
 	gl.enableVertexAttribArray(a_covA);
 	gl.bindBuffer(gl.ARRAY_BUFFER, covABuffer);
 	gl.vertexAttribPointer(a_covA, 3, gl.FLOAT, false, 0, 0);
-	ext.vertexAttribDivisorANGLE(a_covA, 1); // Use the extension here
 
 	const covBBuffer = gl.createBuffer();
 	const a_covB = gl.getAttribLocation(program, "covB");
 	gl.enableVertexAttribArray(a_covB);
 	gl.bindBuffer(gl.ARRAY_BUFFER, covBBuffer);
 	gl.vertexAttribPointer(a_covB, 3, gl.FLOAT, false, 0, 0);
-	ext.vertexAttribDivisorANGLE(a_covB, 1); // Use the extension here
 
+
+    
+	const indexInit = new Float32Array([0,1,2,0,2,3]);
+	const indexBuffer = gl.createBuffer();
+    
+    
 	let lastProj = [];
 	let lastData;
+    
+	// indices
+
+	gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+
+	let indexCount = 0; 
 
 	worker.onmessage = (e) => {
 		if (e.data.buffer) {
@@ -861,12 +928,16 @@ async function main() {
 			link.href = URL.createObjectURL(blob);
 			document.body.appendChild(link);
 			link.click();
-		} else {
-			let { covA, covB, center, color, viewProj } = e.data;
+        
+		} else if (e.data.center) {
+			let { vertices, covA, covB, center, color, viewProj } = e.data;
 			lastData = e.data;
 
 			lastProj = viewProj;
 			vertexCount = center.length / 3;
+            
+			gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+			gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.DYNAMIC_DRAW);
 
 			gl.bindBuffer(gl.ARRAY_BUFFER, centerBuffer);
 			gl.bufferData(gl.ARRAY_BUFFER, center, gl.DYNAMIC_DRAW);
@@ -879,6 +950,14 @@ async function main() {
 
 			gl.bindBuffer(gl.ARRAY_BUFFER, covBBuffer);
 			gl.bufferData(gl.ARRAY_BUFFER, covB, gl.DYNAMIC_DRAW);
+		} else if (e.data.index) {
+			console.log("Updating indices");
+			let { index } = e.data;
+			indexCount = index.length;
+			console.log(indexCount + " indices")
+			gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+			gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index, gl.DYNAMIC_DRAW);
+            
 		}
 	};
 
@@ -887,22 +966,22 @@ async function main() {
 	window.addEventListener("keydown", (e) => {
 		if (document.activeElement != document.body) return;
 		carousel = false;
-		if (!activeKeys.includes(e.key)) activeKeys.push(e.key);
-		if (/\d/.test(e.key)) {
-			viewMatrix = getViewMatrix(cameras[parseInt(e.key)]);
+		if (!activeKeys.includes(e.code)) activeKeys.push(e.code);
+		if (/\d/.test(e.code)) {
+			viewMatrix = getViewMatrix(cameras[parseInt(e.code)]);
 		}
-		if (e.key == "v") {
+		if (e.code == "KeyV") {
 			location.hash =
 				"#" +
 				JSON.stringify(
 					viewMatrix.map((k) => Math.round(k * 100) / 100),
 				);
-		} else if (e.key === "p") {
+		} else if (e.code === "KeyP") {
 			carousel = true;
 		}
 	});
 	window.addEventListener("keyup", (e) => {
-		activeKeys = activeKeys.filter((k) => k !== e.key);
+		activeKeys = activeKeys.filter((k) => k !== e.code);
 	});
 	window.addEventListener("blur", () => {
 		activeKeys = [];
@@ -952,6 +1031,7 @@ async function main() {
 		{ passive: false },
 	);
 
+	let moving = false;
 	let startX, startY, down;
 	canvas.addEventListener("mousedown", (e) => {
 		carousel = false;
@@ -971,6 +1051,7 @@ async function main() {
 	canvas.addEventListener("mousemove", (e) => {
 		e.preventDefault();
 		if (down == 1) {
+			moving = true;
 			let inv = invert4(viewMatrix);
 			let dx = (5 * (e.clientX - startX)) / innerWidth;
 			let dy = (5 * (e.clientY - startY)) / innerHeight;
@@ -988,6 +1069,7 @@ async function main() {
 			startX = e.clientX;
 			startY = e.clientY;
 		} else if (down == 2) {
+			moving = false;
 			let inv = invert4(viewMatrix);
 			// inv = rotateY(inv, );
 			let preY = inv[13];
@@ -1006,6 +1088,7 @@ async function main() {
 	});
 	canvas.addEventListener("mouseup", (e) => {
 		e.preventDefault();
+		moving = false;
 		down = false;
 		startX = 0;
 		startY = 0;
@@ -1017,6 +1100,7 @@ async function main() {
 		"touchstart",
 		(e) => {
 			e.preventDefault();
+			moving = true;
 			if (e.touches.length === 1) {
 				carousel = false;
 				startX = e.touches[0].clientX;
@@ -1103,6 +1187,7 @@ async function main() {
 		"touchend",
 		(e) => {
 			e.preventDefault();
+			moving = false;
 			down = false;
 			startX = 0;
 			startY = 0;
@@ -1144,21 +1229,21 @@ async function main() {
 		if (activeKeys.includes("ArrowRight"))
 			inv = translate4(inv, 0.03, 0, 0);
 		// inv = rotate4(inv, 0.01, 0, 1, 0);
-		if (activeKeys.includes("a")) inv = rotate4(inv, -0.01, 0, 1, 0);
-		if (activeKeys.includes("d")) inv = rotate4(inv, 0.01, 0, 1, 0);
-		if (activeKeys.includes("q")) inv = rotate4(inv, 0.01, 0, 0, 1);
-		if (activeKeys.includes("e")) inv = rotate4(inv, -0.01, 0, 0, 1);
-		if (activeKeys.includes("w")) inv = rotate4(inv, 0.005, 1, 0, 0);
-		if (activeKeys.includes("s")) inv = rotate4(inv, -0.005, 1, 0, 0);
+		if (activeKeys.includes("KeyA")) inv = rotate4(inv, -0.01, 0, 1, 0);
+		if (activeKeys.includes("KeyD")) inv = rotate4(inv, 0.01, 0, 1, 0);
+		if (activeKeys.includes("KeyQ")) inv = rotate4(inv, 0.01, 0, 0, 1);
+		if (activeKeys.includes("KeyE")) inv = rotate4(inv, -0.01, 0, 0, 1);
+		if (activeKeys.includes("KeyW")) inv = rotate4(inv, 0.005, 1, 0, 0);
+		if (activeKeys.includes("KeyS")) inv = rotate4(inv, -0.005, 1, 0, 0);
 
-		if (["j", "k", "l", "i"].some((k) => activeKeys.includes(k))) {
+		if (["KeyJ", "KeyK", "KeyL", "KeyI"].some((k) => activeKeys.includes(k))) {
 			let d = 4;
 			inv = translate4(inv, 0, 0, d);
 			inv = rotate4(
 				inv,
-				activeKeys.includes("j")
+				activeKeys.includes("KeyJ")
 					? -0.05
-					: activeKeys.includes("l")
+					: activeKeys.includes("KeyI")
 					? 0.05
 					: 0,
 				0,
@@ -1167,9 +1252,9 @@ async function main() {
 			);
 			inv = rotate4(
 				inv,
-				activeKeys.includes("i")
+				activeKeys.includes("KeyI")
 					? 0.05
-					: activeKeys.includes("k")
+					: activeKeys.includes("KeyK")
 					? -0.05
 					: 0,
 				1,
@@ -1192,7 +1277,7 @@ async function main() {
 			viewMatrix = invert4(inv);
 		}
 
-		if (activeKeys.includes(" ")) {
+		if (activeKeys.includes("KeySpace")) {
 			jumpDelta = Math.min(1, jumpDelta + 0.05);
 		} else {
 			jumpDelta = Math.max(0, jumpDelta - 0.05);
@@ -1204,7 +1289,7 @@ async function main() {
 		let actualViewMatrix = invert4(inv2);
 
 		const viewProj = multiply4(projectionMatrix, actualViewMatrix);
-		worker.postMessage({ view: viewProj });
+		worker.postMessage({ view: viewProj, down: moving });
 
 		const currentFps = 1000 / (now - lastFrame) || 0;
 		avgFps = avgFps * 0.9 + currentFps * 0.1;
@@ -1213,7 +1298,7 @@ async function main() {
 			document.getElementById("spinner").style.display = "none";
 			// console.time('render')
 			gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
-			ext.drawArraysInstancedANGLE(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+			gl.drawElements(gl.TRIANGLES, vertexCount, gl.UNSIGNED_INT, 0);
 			// console.timeEnd('render')
 		} else {
 			gl.clear(gl.COLOR_BUFFER_BIT);
